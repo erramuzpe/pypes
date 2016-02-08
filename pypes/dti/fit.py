@@ -141,23 +141,21 @@ def write_acquisition_parameters(in_file, epi_factor=128):
     return op.abspath(acqp_file), op.abspath(index_file)
 
 
-def warp_atlas_wf(atlas_file)
+def spm_warp_atlas_wf(atlas_file, wf_name='warp_atlas'):
     """
 
     Nipype Inputs
     -------------
-    dti_input.diff: traits.File
-        path to the diffusion MRI image
-    dti_input.bval: traits.File
-        path to the bvals file
-    dti_input.bvec: traits.File
-        path to the bvecs file
-    dti_input.tissues: traits.File
+    atlas_warp_in.tissues: traits.File
         paths to the NewSegment c*.nii output files
-    dti_input.anat: traits.File
+    atlas_warp_in.anat: traits.File
         path to the high-contrast anatomical image
-    dti_input.mni_to_anat: traits.File
+    atlas_warp_in.mni_to_anat: traits.File
         path to the warp from MNI space to anat space
+
+    Nipype Outputs
+    --------------
+    atlas_warp_out.warped_atlas: traits.File
 
     Nipype Workflow Dependencies
     ----------------------------
@@ -168,39 +166,63 @@ def warp_atlas_wf(atlas_file)
     -------
     wf: nipype Workflow
     """
-    dti_input    = pe.Node(IdentityInterface(
-        fields=["diff", "bval", "bvec", "tissues", "anat", "mni_to_anat"],
-        mandatory_inputs=True),                                 name="dti_input")
-    gunzip_atlas = pe.Node(Gunzip(in_file=atlas_file),          name="gunzip_atlas")
+    atlas_warp_in = pe.Node(IdentityInterface(
+        fields=["target", "tissues", "anat", "mni_to_anat"],
+        mandatory_inputs=True),                                   name="atlas_warp_in")
+    gunzip_atlas = pe.Node(Gunzip(in_file=atlas_file),            name="gunzip_atlas")
     anat_bbox    = pe.Node(Function(
         input_names=["in_file"],
         output_names=["bbox"],
-        function=get_bounding_box),                             name="anat_bbox")
-    warp_atlas   = pe.Node(spm_apply_deformations(),            name="warp_atlas")
+        function=get_bounding_box),                               name="anat_bbox")
+    brain_sel    = pe.Node(Select(index=[0, 1, 2]),               name="brain_sel")
+    warp_atlas   = pe.Node(spm_apply_deformations(),              name="warp_atlas")
+    brain_merge  = pe.Node(MultiImageMaths(),                     name="brain_merge")
+    coreg_target = pe.Node(spm_coregister(cost_function="mi"),    name="coreg_target")
+    coreg_merge  = pe.Node(Merge(2),                              name="coreg_merge")
+    coreg_split  = pe.Node(Split(splits=[1, 2, 1], squeeze=True), name="coreg_split")
+    atlas_warp_out = pe.Node(IdentityInterface(
+        fields=["tissues_warped", "brain_mask_warped", "atlas_warped"]),
+                                                                  name="atlas_warp_out")
+
+    brain_merge.inputs.op_string = "-add '%s' -add '%s' -abs -bin"
+    brain_merge.inputs.out_file = "brain_mask_diff_space.nii.gz"
 
     warp_atlas.inputs.write_interp = 0
 
+    # Create the workflow object
+    wf = pe.Workflow(name=wf_name)
+
     wf.connect([
-                (dti_input,     anat_bbox,      [("anat",                "in_file")]),
-                (dti_input,     warp_atlas,     [("mni_to_anat",         "deformation_file")]),
+                # the anat file to coregister to diff space
+                (atlas_warp_in, coreg_target,   [("anat",                "source")]),
+
+                # the deformation field to warp the atlas to anat space
+                (atlas_warp_in, warp_atlas,     [("mni_to_anat",         "deformation_file")]),
+
+                # the atlas file to be unzipped
                 (gunzip_atlas,  warp_atlas,     [("out_file",            "apply_to_files")]),
+
+                # the bounding box for warping atlas reference
+                (atlas_warp_in, anat_bbox,      [("anat",                "in_file")]),
                 (anat_bbox,     warp_atlas,     [("bbox",                "write_bounding_box")]),
-                (write_acqp,    eddy,           [("out_acqp",            "in_acqp"),
-                                                 ("out_index",           "in_index")]),
-                (extract_b0,    gunzip_b0,      [("roi_file",            "in_file")]),
-                (gunzip_b0,     coreg_b0,       [("out_file",            "target")]),
+
+                # select 3 first volumes from the tissues files and add the warped atlas
+                (atlas_warp_in, brain_sel,      [("tissues",             "inlist")]),
                 (brain_sel,     coreg_merge,    [(("out", flatten_list), "in1")]),
                 (warp_atlas,    coreg_merge,    [("normalized_files",    "in2")]),
-                (coreg_merge,   coreg_b0,       [("out",                 "apply_to_files")]),
-                (coreg_b0,      coreg_split,    [("coregistered_files",  "inlist")]),
+
+                # the merged 4 volumes for coregistration
+                (coreg_merge,   coreg_target,   [("out",                 "apply_to_files")]),
+                (coreg_target,  coreg_split,    [("coregistered_files",  "inlist")]),
+
+                # split the coregistration results to create the mask
                 (coreg_split,   brain_merge,    [("out1",                "in_file")]),
                 (coreg_split,   brain_merge,    [("out2",                "operand_files")]),
-                (coreg_split,   dti_output,     [("out3",                "atlas_diff")]),
-                (brain_merge,   eddy,           [("out_file",            "in_mask")]),
-                (brain_merge,   dti_output,     [("out_file",            "brain_mask_diff")]),
-                (eddy,          dti_output,     [("out_corrected",       "diff_corrected")]),
-                (eddy,          rot_bvec,       [("out_parameter",       "eddy_params")]),
-                (rot_bvec,      dti_output,     [("out_file",            "bvec_rotated")]),
+
+                # prepare the output files
+                (rot_bvec,      atlas_warp_out, [("out_file",            "tissues_warped")]),
+                (coreg_split,   atlas_warp_out, [("out3",                "atlas_warped")]),
+                (brain_merge,   atlas_warp_out, [("out_file",            "brain_mask_warped")]),
               ])
     return wf
 
@@ -226,6 +248,16 @@ def fsl_dti_preprocessing(atlas_file, wf_name="fsl_dti_preproc"):
     dti_input.mni_to_anat: traits.File
         path to the warp from MNI space to anat space
 
+    Nipype Outputs
+    --------------
+    dti_output.diff_corrected: traits.File
+
+    dti_output.bvec_rotated: traits.File
+
+    dti_output.brain_mask_diff: traits.File
+
+    dti_output.atlas_diff: traits.File
+
     Nipype Workflow Dependencies
     ----------------------------
     This workflow depends on:
@@ -245,7 +277,7 @@ def fsl_dti_preprocessing(atlas_file, wf_name="fsl_dti_preproc"):
         output_names=["bbox"],
         function=get_bounding_box),                             name="anat_bbox")
     warp_atlas   = pe.Node(spm_apply_deformations(),            name="warp_atlas")
-    write_acqp     = pe.Node(Function(
+    write_acqp   = pe.Node(Function(
         input_names=["in_file"],
         output_names=["out_acqp", "out_index"],
         function=write_acquisition_parameters),                 name="write_acqp")
@@ -277,34 +309,57 @@ def fsl_dti_preprocessing(atlas_file, wf_name="fsl_dti_preproc"):
 
     # Connect the nodes
     wf.connect([
-                (dti_input,     extract_b0,     [("diff",                "in_file")]),
-                (dti_input,     write_acqp,     [("diff",                "in_file")]),
+                # the diff file, bvals and bvecs for eddy correction with `eddy`
                 (dti_input,     eddy,           [("diff",                "in_file")]),
                 (dti_input,     eddy,           [("bval",                "in_bval")]),
                 (dti_input,     eddy,           [("bvec",                "in_bvec")]),
-                (dti_input,     rot_bvec,       [("bvec",                "in_bvec")]),
-                (dti_input,     brain_sel,      [("tissues",             "inlist")]),
-                (dti_input,     anat_bbox,      [("anat",                "in_file")]),
+
+                # the anat file to coregister to diff space
                 (dti_input,     coreg_b0,       [("anat",                "source")]),
+
+                # the deformation field to warp the atlas to anat space
                 (dti_input,     warp_atlas,     [("mni_to_anat",         "deformation_file")]),
+
+                # the atlas file to be unzipped
                 (gunzip_atlas,  warp_atlas,     [("out_file",            "apply_to_files")]),
+
+                # the bounding box for warping atlas reference
+                (dti_input,     anat_bbox,      [("anat",                "in_file")]),
                 (anat_bbox,     warp_atlas,     [("bbox",                "write_bounding_box")]),
+
+                # the acquisition parameters for eddy correction
+                (dti_input,     write_acqp,     [("diff",                "in_file")]),
                 (write_acqp,    eddy,           [("out_acqp",            "in_acqp"),
                                                  ("out_index",           "in_index")]),
+
+                # the b=0 volume file to be unzipped and the coregistration target
+                (dti_input,     extract_b0,     [("diff",                "in_file")]),
                 (extract_b0,    gunzip_b0,      [("roi_file",            "in_file")]),
                 (gunzip_b0,     coreg_b0,       [("out_file",            "target")]),
+
+                # select 3 first volumes from the tissues files and add the warped atlas
+                (dti_input,     brain_sel,      [("tissues",             "inlist")]),
                 (brain_sel,     coreg_merge,    [(("out", flatten_list), "in1")]),
                 (warp_atlas,    coreg_merge,    [("normalized_files",    "in2")]),
+
+                # the merged 4 volumes for coregistration
                 (coreg_merge,   coreg_b0,       [("out",                 "apply_to_files")]),
                 (coreg_b0,      coreg_split,    [("coregistered_files",  "inlist")]),
+
+                # split the coregistration results to create the mask
                 (coreg_split,   brain_merge,    [("out1",                "in_file")]),
                 (coreg_split,   brain_merge,    [("out2",                "operand_files")]),
-                (coreg_split,   dti_output,     [("out3",                "atlas_diff")]),
                 (brain_merge,   eddy,           [("out_file",            "in_mask")]),
+
+                # the bvec file for bvecs rotation after `eddy`
+                (dti_input,     rot_bvec,       [("bvec",                "in_bvec")]),
+                (eddy,          rot_bvec,       [("out_parameter",       "eddy_params")]),
+
+                # prepare the output files
+                (rot_bvec,      dti_output,     [("out_file",            "bvec_rotated")]),
+                (coreg_split,   dti_output,     [("out3",                "atlas_diff")]),
                 (brain_merge,   dti_output,     [("out_file",            "brain_mask_diff")]),
                 (eddy,          dti_output,     [("out_corrected",       "diff_corrected")]),
-                (eddy,          rot_bvec,       [("out_parameter",       "eddy_params")]),
-                (rot_bvec,      dti_output,     [("out_file",            "bvec_rotated")]),
               ])
     return wf
 
